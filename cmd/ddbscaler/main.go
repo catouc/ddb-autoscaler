@@ -46,7 +46,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	scalingTargets := []scaler.TableScalingConfiguration{
+	scalingTargets := []*scaler.TableScalingConfiguration{
 		{
 			TableName:           "test-throttles",
 			ReadLowerBound:      1,
