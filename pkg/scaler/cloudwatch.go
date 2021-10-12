@@ -2,6 +2,7 @@ package scaler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -20,31 +21,49 @@ const (
 )
 
 type tableCapacity struct {
-	readCapacity  capacity
-	writeCapacity capacity
+	ReadCapacity  capacity
+	WriteCapacity capacity
 }
 
 type capacity struct {
-	capType     capacityType
-	consumed    *float64
-	provisioned *int64
-	throttles   float64
+	CapType     capacityType
+	Consumed    *float64
+	Provisioned *int64
+	Throttles   float64
+}
+
+func (tc *tableCapacity) String() string {
+	tcBytes, err := json.Marshal(*tc)
+	if err != nil {
+		return ""
+	}
+
+	return string(tcBytes)
+}
+
+func (c *capacity) String() string {
+	cBytes, err := json.Marshal(*c)
+	if err != nil {
+		return ""
+	}
+
+	return string(cBytes)
 }
 
 func (tc *tableCapacity) isSafe() bool {
-	if tc.readCapacity.consumed == nil {
+	if tc.ReadCapacity.Consumed == nil {
 		return false
 	}
 
-	if tc.readCapacity.provisioned == nil {
+	if tc.ReadCapacity.Provisioned == nil {
 		return false
 	}
 
-	if tc.writeCapacity.consumed == nil {
+	if tc.WriteCapacity.Consumed == nil {
 		return false
 	}
 
-	if tc.writeCapacity.provisioned == nil {
+	if tc.WriteCapacity.Provisioned == nil {
 		return false
 	}
 
@@ -59,11 +78,11 @@ func (s *Scaler) getTableCapacity(ctx context.Context, tableName string) (*table
 	}
 
 	c := tableCapacity{
-		readCapacity: capacity{
-			capType: readCapacity,
+		ReadCapacity: capacity{
+			CapType: readCapacity,
 		},
-		writeCapacity: capacity{
-			capType: writeCapacity,
+		WriteCapacity: capacity{
+			CapType: writeCapacity,
 		},
 	}
 
@@ -71,22 +90,24 @@ func (s *Scaler) getTableCapacity(ctx context.Context, tableName string) (*table
 		switch *mdr.Id {
 		case strings.ToLower(DDBConsumedReadCapacityUnits):
 			if len(mdr.Values) >= 1 {
-				c.readCapacity.consumed = aws.Float64(mdr.Values[0] / 60)
+				c.ReadCapacity.Consumed = aws.Float64(mdr.Values[0] / 60)
 			}
 		case strings.ToLower(DDBReadThrottleEvents):
 			if len(mdr.Values) >= 1 {
+				// FIXME: looking back 3m means we scale up multiple times if interval is < 3m
 				if time.Now().Sub(mdr.Timestamps[0]) < 3*time.Minute {
-					c.readCapacity.throttles = mdr.Values[0]
+					c.ReadCapacity.Throttles = mdr.Values[0]
 				}
 			}
 		case strings.ToLower(DDBConsumedWriteCapacityUnits):
 			if len(mdr.Values) >= 1 {
-				c.writeCapacity.consumed = aws.Float64(mdr.Values[0] / 60)
+				c.WriteCapacity.Consumed = aws.Float64(mdr.Values[0] / 60)
 			}
 		case strings.ToLower(DDBWriteThrottleEvents):
 			if len(mdr.Values) >= 1 {
+				// FIXME: looking back 3m means we scale up multiple times if interval is < 3m
 				if time.Now().Sub(mdr.Timestamps[0]) < 3*time.Minute {
-					c.writeCapacity.throttles = mdr.Values[0]
+					c.WriteCapacity.Throttles = mdr.Values[0]
 				}
 			}
 		default:

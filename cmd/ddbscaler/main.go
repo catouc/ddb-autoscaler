@@ -6,11 +6,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-
-	log "github.com/sirupsen/logrus"
+	"time"
 
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/deichindianer/ddb-autoscaler/pkg/scaler"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -41,21 +41,31 @@ func main() {
 		cancel()
 	}()
 
-	cfg, err := awsConfig.LoadDefaultConfig(ctx)
+	awsCfg, err := awsConfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	scalingTargets := []*scaler.TableScalingConfiguration{
-		{
-			TableName:           "test-throttles",
-			ReadLowerBound:      1,
-			WriteLowerBound:     1,
-			WriteUpperBound:     500,
-			WriteBufferCapacity: 0.1,
+	scalerCfg := scaler.Config{
+		AWSConfig: awsCfg,
+		Interval:  60 * time.Second,
+		ScalingTargets: []*scaler.TableScalingConfig{
+			{
+				TableName:           "test-throttles",
+				ScaleDownDelay:      60 * time.Minute,
+				ReadLowerBound:      1,
+				WriteLowerBound:     1,
+				ReadUpperBound:      500,
+				WriteUpperBound:     500,
+				ReadBufferCapacity:  0.5,
+				WriteBufferCapacity: 0.5,
+			},
 		},
 	}
 
-	s := scaler.New(cfg, scalingTargets)
-	s.Run(ctx)
+	s := scaler.New(scalerCfg)
+
+	if err := s.Run(ctx); err != nil {
+		log.Error(err.Error())
+	}
 }

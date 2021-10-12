@@ -19,33 +19,27 @@ const readCapacity = "read"
 const writeCapacity = "write"
 
 type Scaler struct {
-	cwClient       *cloudwatch.Client
-	ddbClient      *dynamodb.Client
-	ScalingTargets []*TableScalingConfiguration
+	Config    Config
+	cwClient  *cloudwatch.Client
+	ddbClient *dynamodb.Client
 }
 
-type TableScalingConfiguration struct {
-	TableName           string
-	ReadUpperBound      float64
-	WriteUpperBound     float64
-	ReadLowerBound      float64
-	WriteLowerBound     float64
-	ReadBufferCapacity  float64
-	WriteBufferCapacity float64
-}
-
-func New(cfg aws.Config, scalingTargets []*TableScalingConfiguration) *Scaler {
+func New(cfg Config) *Scaler {
 	return &Scaler{
-		cwClient:       cloudwatch.NewFromConfig(cfg),
-		ddbClient:      dynamodb.NewFromConfig(cfg),
-		ScalingTargets: scalingTargets,
+		Config:    cfg,
+		cwClient:  cloudwatch.NewFromConfig(cfg.AWSConfig),
+		ddbClient: dynamodb.NewFromConfig(cfg.AWSConfig),
 	}
 }
 
-func (s *Scaler) Run(ctx context.Context) {
-	log.Debugf("config: %+v", s.ScalingTargets)
+func (s *Scaler) Run(ctx context.Context) error {
+	log.Debugf("config: %v", s.Config.ScalingTargets)
 
-	ticker := time.NewTicker(1 * time.Minute)
+	if err := s.Config.Check(); err != nil {
+		return fmt.Errorf("config check failed: %w", err)
+	}
+
+	ticker := time.NewTicker(s.Config.Interval)
 
 	s.scaleTargets(ctx)
 
@@ -53,7 +47,8 @@ func (s *Scaler) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			log.Infof("stopping execution: %s", ctx.Err())
-			return
+
+			return nil
 		case <-ticker.C:
 			s.scaleTargets(ctx)
 		}
@@ -61,7 +56,7 @@ func (s *Scaler) Run(ctx context.Context) {
 }
 
 func (s *Scaler) scaleTargets(ctx context.Context) {
-	for _, target := range s.ScalingTargets {
+	for _, target := range s.Config.ScalingTargets {
 		err := s.scaleTarget(ctx, target)
 		if err != nil {
 			log.WithField("tableName", target.TableName).Warnf("skipping scaling action: %s", err)
@@ -69,7 +64,7 @@ func (s *Scaler) scaleTargets(ctx context.Context) {
 	}
 }
 
-func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfiguration) error {
+func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfig) error {
 	table, err := s.ddbClient.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(target.TableName)})
 	if err != nil {
 		return fmt.Errorf("failed to get table status: %w", err)
@@ -84,8 +79,10 @@ func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfigurat
 		return fmt.Errorf("failed to get table capacity: %w", err)
 	}
 
-	tableCap.readCapacity.provisioned = table.Table.ProvisionedThroughput.ReadCapacityUnits
-	tableCap.writeCapacity.provisioned = table.Table.ProvisionedThroughput.WriteCapacityUnits
+	tableCap.ReadCapacity.Provisioned = table.Table.ProvisionedThroughput.ReadCapacityUnits
+	tableCap.WriteCapacity.Provisioned = table.Table.ProvisionedThroughput.WriteCapacityUnits
+
+	log.WithField("tableName", target.TableName).Debugf("table capacity: %v", tableCap)
 
 	if !tableCap.isSafe() {
 		return fmt.Errorf("table capacity is not safe: %+v", *tableCap)
@@ -98,9 +95,32 @@ func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfigurat
 
 	if (newReadCap >= 1 || newWriteCap >= 1) &&
 		(newReadCap != *table.Table.ProvisionedThroughput.ReadCapacityUnits || newWriteCap != *table.Table.ProvisionedThroughput.WriteCapacityUnits) {
-		err = s.updateTableCapacity(ctx, table.Table, newReadCap, newWriteCap)
-		if err != nil {
-			return fmt.Errorf("failed to scale table: %w", err)
+
+		if newReadCap < *table.Table.ProvisionedThroughput.ReadCapacityUnits && newReadCap > 0 {
+			if time.Now().Sub(target.lastScaleDown) < target.ScaleDownDelay {
+				log.WithField("tableName", target.TableName).Debugf("skipping read scale down, next allowed at %s", target.lastScaleDown.Add(target.ScaleDownDelay).Format(time.RFC3339))
+				newReadCap = 0
+			} else {
+				target.lastScaleDown = time.Now()
+			}
+		}
+
+		if newWriteCap < *table.Table.ProvisionedThroughput.WriteCapacityUnits && newWriteCap > 0 {
+			if time.Now().Sub(target.lastScaleDown) < target.ScaleDownDelay {
+				log.WithField("tableName", target.TableName).Debugf("skipping write scale down, next allowed at %s", target.lastScaleDown.Add(target.ScaleDownDelay).Format(time.RFC3339))
+				newWriteCap = 0
+			} else {
+				target.lastScaleDown = time.Now()
+			}
+		}
+
+		if newReadCap != 0 && newWriteCap != 0 {
+			err = s.updateTableCapacity(ctx, table.Table, newReadCap, newWriteCap)
+			if err != nil {
+				return fmt.Errorf("failed to scale table: %w", err)
+			}
+
+			return nil
 		}
 	}
 
@@ -109,34 +129,34 @@ func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfigurat
 	return nil
 }
 
-func (s *Scaler) calculateNewCapacity(tableCap *tableCapacity, target *TableScalingConfiguration) (int64, int64, error) {
+func (s *Scaler) calculateNewCapacity(tableCap *tableCapacity, target *TableScalingConfig) (int64, int64, error) {
 	var newReadCap, newWriteCap int64
 
 	var err error
 
-	if tableCap.readCapacity.throttles > 0 && tableCap.readCapacity.provisioned != nil {
-		newReadCap, err = makeThrottlingScalingDecision(tableCap.readCapacity, target)
+	if tableCap.ReadCapacity.Throttles > 0 && tableCap.ReadCapacity.Provisioned != nil {
+		newReadCap, err = makeThrottlingScalingDecision(tableCap.ReadCapacity, target)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to make read throttle scaling decision: %w", err)
 		}
 	}
 
-	if tableCap.writeCapacity.throttles > 0 && tableCap.writeCapacity.provisioned != nil {
-		newWriteCap, err = makeThrottlingScalingDecision(tableCap.writeCapacity, target)
+	if tableCap.WriteCapacity.Throttles > 0 && tableCap.WriteCapacity.Provisioned != nil {
+		newWriteCap, err = makeThrottlingScalingDecision(tableCap.WriteCapacity, target)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to make write throttle scaling decision: %w", err)
 		}
 	}
 
 	if newReadCap == 0 {
-		newReadCap, err = makeConsumptionScalingDecision(tableCap.readCapacity, target)
+		newReadCap, err = makeConsumptionScalingDecision(tableCap.ReadCapacity, target)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to make read consumption scaling decision: %w", err)
 		}
 	}
 
 	if newWriteCap == 0 {
-		newWriteCap, err = makeConsumptionScalingDecision(tableCap.writeCapacity, target)
+		newWriteCap, err = makeConsumptionScalingDecision(tableCap.WriteCapacity, target)
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to make write consumption scaling decision: %w", err)
 		}
@@ -172,10 +192,10 @@ func (s *Scaler) updateTableCapacity(ctx context.Context, table *dynamodbTypes.T
 	return nil
 }
 
-func makeThrottlingScalingDecision(c capacity, target *TableScalingConfiguration) (int64, error) {
-	switch c.capType {
+func makeThrottlingScalingDecision(c capacity, target *TableScalingConfig) (int64, error) {
+	switch c.CapType {
 	case readCapacity:
-		result := (c.throttles + float64(*c.provisioned)) * (1 + target.ReadBufferCapacity)
+		result := (c.Throttles + float64(*c.Provisioned)) * (1 + target.ReadBufferCapacity)
 		if result > 40000 {
 			result = 40000
 		}
@@ -186,7 +206,7 @@ func makeThrottlingScalingDecision(c capacity, target *TableScalingConfiguration
 
 		return int64(math.Round(result)), nil
 	case writeCapacity:
-		result := (c.throttles + float64(*c.provisioned)) * (1 + target.WriteBufferCapacity)
+		result := (c.Throttles + float64(*c.Provisioned)) * (1 + target.WriteBufferCapacity)
 		if result > 40000 {
 			result = 40000
 		}
@@ -197,18 +217,18 @@ func makeThrottlingScalingDecision(c capacity, target *TableScalingConfiguration
 
 		return int64(math.Round(result)), nil
 	default:
-		return 0, fmt.Errorf("unknown capacity type: %s", c.capType)
+		return 0, fmt.Errorf("unknown capacity type: %s", c.CapType)
 	}
 }
 
-func makeConsumptionScalingDecision(c capacity, target *TableScalingConfiguration) (int64, error) {
-	switch c.capType {
+func makeConsumptionScalingDecision(c capacity, target *TableScalingConfig) (int64, error) {
+	switch c.CapType {
 	case readCapacity:
-		return calculateNewBoundary(float64(*c.provisioned), *c.consumed, target.ReadBufferCapacity, target.ReadLowerBound, target.ReadUpperBound), nil
+		return calculateNewBoundary(float64(*c.Provisioned), *c.Consumed, target.ReadBufferCapacity, target.ReadLowerBound, target.ReadUpperBound), nil
 	case writeCapacity:
-		return calculateNewBoundary(float64(*c.provisioned), *c.consumed, target.ReadBufferCapacity, target.ReadLowerBound, target.ReadUpperBound), nil
+		return calculateNewBoundary(float64(*c.Provisioned), *c.Consumed, target.ReadBufferCapacity, target.ReadLowerBound, target.ReadUpperBound), nil
 	default:
-		return 0, fmt.Errorf("unknown capacity type: %s", c.capType)
+		return 0, fmt.Errorf("unknown capacity type: %s", c.CapType)
 	}
 }
 
@@ -224,7 +244,7 @@ func calculateNewBoundary(provisioned, consumed, buffer, lowerBound, upperBound 
 		return int64(math.Round(newBoundary))
 	}
 
-	newBoundary := consumed * buffer
+	newBoundary := consumed * (1 + buffer)
 
 	if newBoundary < lowerBound {
 		newBoundary = lowerBound
