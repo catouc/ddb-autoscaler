@@ -43,6 +43,8 @@ func New(cfg aws.Config, scalingTargets []TableScalingConfiguration) *Scaler {
 }
 
 func (s *Scaler) Run(ctx context.Context) {
+	log.Debugf("config: %+v", s.ScalingTargets)
+
 	ticker := time.NewTicker(1 * time.Minute)
 
 	s.scaleTargets(ctx)
@@ -60,92 +62,103 @@ func (s *Scaler) Run(ctx context.Context) {
 
 func (s *Scaler) scaleTargets(ctx context.Context) {
 	for _, target := range s.ScalingTargets {
-		table, err := s.ddbClient.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(target.TableName)})
+		err := s.scaleTarget(ctx, target)
 		if err != nil {
-			log.Warnf("skipping scaling action: failed to get table status for %s: %s", target.TableName, err)
-			continue
+			log.Warn(err)
 		}
-
-		if table.Table.TableStatus != "ACTIVE" {
-			log.Warnf("skipping scaling action: table %s is currently in status: %s", target.TableName, table.Table.TableStatus)
-			continue
-		}
-
-		tableCap, err := s.getTableCapacity(ctx, target.TableName)
-		if err != nil {
-			log.Warnf("failed to get table capacity for %s: %s", target.TableName, err)
-		}
-
-		tableCap.readCapacity.provisioned = table.Table.ProvisionedThroughput.ReadCapacityUnits
-		tableCap.writeCapacity.provisioned = table.Table.ProvisionedThroughput.WriteCapacityUnits
-
-		if !tableCap.isSafe() {
-			log.Errorf("table capacity is not safe, skipping table %s: %+v", target.TableName, *tableCap)
-			continue
-		}
-
-		var newReadCap, newWriteCap int64
-
-		if tableCap.readCapacity.throttles > 0 && tableCap.readCapacity.provisioned != nil {
-			newReadCap, err = makeThrottlingScalingDecision(tableCap.readCapacity, target)
-			if err != nil {
-				log.Warnf("skipping scaling action: failed to make read throttle scaling decision for %s: %s", target.TableName, err)
-				continue
-			}
-		}
-
-		if tableCap.writeCapacity.throttles > 0 && tableCap.writeCapacity.provisioned != nil {
-			newWriteCap, err = makeThrottlingScalingDecision(tableCap.writeCapacity, target)
-			if err != nil {
-				log.Warnf("skipping scaling action: failed to make write throttle scaling decision for %s: %s", target.TableName, err)
-				continue
-			}
-		}
-
-		if newReadCap == 0 {
-			newReadCap, err = makeLowConsumptionScalingDecision(tableCap.readCapacity, target)
-			if err != nil {
-				log.Warnf("skipping scaling action: failed to make read low consumption scaling decision for %s: %s", target.TableName, err)
-				continue
-			}
-		}
-
-		if newWriteCap == 0 {
-			newWriteCap, err = makeLowConsumptionScalingDecision(tableCap.writeCapacity, target)
-			if err != nil {
-				log.Warnf("skipping scaling action: failed to make write low consumption scaling decision for %s: %s", target.TableName, err)
-				continue
-			}
-		}
-
-		if (newReadCap >= 1 || newWriteCap >= 1) &&
-			(newReadCap != *table.Table.ProvisionedThroughput.ReadCapacityUnits || newWriteCap != *table.Table.ProvisionedThroughput.WriteCapacityUnits) {
-			provisionThroughput := dynamodbTypes.ProvisionedThroughput{
-				ReadCapacityUnits:  table.Table.ProvisionedThroughput.ReadCapacityUnits,
-				WriteCapacityUnits: table.Table.ProvisionedThroughput.WriteCapacityUnits,
-			}
-
-			if newReadCap > 0 {
-				provisionThroughput.ReadCapacityUnits = aws.Int64(newReadCap)
-			}
-
-			if newWriteCap > 0 {
-				provisionThroughput.WriteCapacityUnits = aws.Int64(newWriteCap)
-			}
-
-			_, err = s.ddbClient.UpdateTable(ctx, &dynamodb.UpdateTableInput{
-				TableName:             aws.String(target.TableName),
-				ProvisionedThroughput: &provisionThroughput,
-			})
-			if err != nil {
-				log.Errorf("failed to scale table %s: %s", target.TableName, err)
-			}
-
-			log.Infof("scaled %s to read=%d,write=%d", target.TableName, newReadCap, newWriteCap)
-			continue
-		}
-		log.Debugf("no scaling necessary for %s", target.TableName)
 	}
+}
+
+func (s *Scaler) scaleTarget(ctx context.Context, target TableScalingConfiguration) error {
+	table, err := s.ddbClient.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(target.TableName)})
+	if err != nil {
+		return fmt.Errorf("skipping scaling action: failed to get table status for %s: %w", target.TableName, err)
+	}
+
+	if table.Table.TableStatus != "ACTIVE" {
+		return fmt.Errorf("skipping scaling action: table %s is currently in status: %s", target.TableName, table.Table.TableStatus)
+	}
+
+	tableCap, err := s.getTableCapacity(ctx, target.TableName)
+	if err != nil {
+		return fmt.Errorf("failed to get table capacity for %s: %w", target.TableName, err)
+	}
+
+	tableCap.readCapacity.provisioned = table.Table.ProvisionedThroughput.ReadCapacityUnits
+	tableCap.writeCapacity.provisioned = table.Table.ProvisionedThroughput.WriteCapacityUnits
+
+	if !tableCap.isSafe() {
+		return fmt.Errorf("table capacity is not safe, skipping table %s: %+v", target.TableName, *tableCap)
+	}
+
+	var newReadCap, newWriteCap int64
+
+	if tableCap.readCapacity.throttles > 0 && tableCap.readCapacity.provisioned != nil {
+		newReadCap, err = makeThrottlingScalingDecision(tableCap.readCapacity, target)
+		if err != nil {
+			return fmt.Errorf("skipping scaling action: failed to make read throttle scaling decision for %s: %w", target.TableName, err)
+		}
+	}
+
+	if tableCap.writeCapacity.throttles > 0 && tableCap.writeCapacity.provisioned != nil {
+		newWriteCap, err = makeThrottlingScalingDecision(tableCap.writeCapacity, target)
+		if err != nil {
+			return fmt.Errorf("skipping scaling action: failed to make write throttle scaling decision for %s: %w", target.TableName, err)
+		}
+	}
+
+	if newReadCap == 0 {
+		newReadCap, err = makeLowConsumptionScalingDecision(tableCap.readCapacity, target)
+		if err != nil {
+			return fmt.Errorf("skipping scaling action: failed to make read low consumption scaling decision for %s: %w", target.TableName, err)
+		}
+	}
+
+	if newWriteCap == 0 {
+		newWriteCap, err = makeLowConsumptionScalingDecision(tableCap.writeCapacity, target)
+		if err != nil {
+			return fmt.Errorf("skipping scaling action: failed to make write low consumption scaling decision for %s: %w", target.TableName, err)
+		}
+	}
+
+	if (newReadCap >= 1 || newWriteCap >= 1) &&
+		(newReadCap != *table.Table.ProvisionedThroughput.ReadCapacityUnits || newWriteCap != *table.Table.ProvisionedThroughput.WriteCapacityUnits) {
+		err = s.updateTableCapacity(ctx, table.Table, newReadCap, newWriteCap)
+		if err != nil {
+			return fmt.Errorf("failed to scale table %s: %w", target.TableName, err)
+		}
+	}
+
+	log.Debugf("no scaling necessary for %s", target.TableName)
+
+	return nil
+}
+
+func (s *Scaler) updateTableCapacity(ctx context.Context, table *dynamodbTypes.TableDescription, newReadCap int64, newWriteCap int64) error {
+	provisionThroughput := dynamodbTypes.ProvisionedThroughput{
+		ReadCapacityUnits:  table.ProvisionedThroughput.ReadCapacityUnits,
+		WriteCapacityUnits: table.ProvisionedThroughput.WriteCapacityUnits,
+	}
+
+	if newReadCap > 0 {
+		provisionThroughput.ReadCapacityUnits = aws.Int64(newReadCap)
+	}
+
+	if newWriteCap > 0 {
+		provisionThroughput.WriteCapacityUnits = aws.Int64(newWriteCap)
+	}
+
+	_, err := s.ddbClient.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName:             table.TableName,
+		ProvisionedThroughput: &provisionThroughput,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update table: %s", err)
+	}
+
+	log.Infof("updated table capacity for %s: read=%d,write=%d", *table.TableName, newReadCap, newWriteCap)
+
+	return nil
 }
 
 func makeThrottlingScalingDecision(c capacity, target TableScalingConfiguration) (int64, error) {
