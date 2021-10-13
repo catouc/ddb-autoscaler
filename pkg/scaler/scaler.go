@@ -97,24 +97,22 @@ func (s *Scaler) scaleTarget(ctx context.Context, target *TableScalingConfig) er
 		(newReadCap != *table.Table.ProvisionedThroughput.ReadCapacityUnits || newWriteCap != *table.Table.ProvisionedThroughput.WriteCapacityUnits) {
 
 		if newReadCap < *table.Table.ProvisionedThroughput.ReadCapacityUnits && newReadCap > 0 {
-			if time.Now().Sub(target.lastScaleDown) < target.ScaleDownDelay {
-				log.WithField("tableName", target.TableName).Debugf("skipping read scale down, next allowed at %s", target.lastScaleDown.Add(target.ScaleDownDelay).Format(time.RFC3339))
+			if time.Now().Sub(target.lastScaleTime) < target.ScaleDownDelay {
+				log.WithField("tableName", target.TableName).Debugf("skipping read scale down, next allowed at %s", target.lastScaleTime.Add(target.ScaleDownDelay).Format(time.RFC3339))
 				newReadCap = 0
-			} else {
-				target.lastScaleDown = time.Now()
 			}
 		}
 
 		if newWriteCap < *table.Table.ProvisionedThroughput.WriteCapacityUnits && newWriteCap > 0 {
-			if time.Now().Sub(target.lastScaleDown) < target.ScaleDownDelay {
-				log.WithField("tableName", target.TableName).Debugf("skipping write scale down, next allowed at %s", target.lastScaleDown.Add(target.ScaleDownDelay).Format(time.RFC3339))
+			if time.Now().Sub(target.lastScaleTime) < target.ScaleDownDelay {
+				log.WithField("tableName", target.TableName).Debugf("skipping write scale down, next allowed at %s", target.lastScaleTime.Add(target.ScaleDownDelay).Format(time.RFC3339))
 				newWriteCap = 0
-			} else {
-				target.lastScaleDown = time.Now()
 			}
 		}
 
 		if newReadCap != 0 && newWriteCap != 0 {
+			target.lastScaleTime = time.Now()
+
 			err = s.updateTableCapacity(ctx, table.Table, newReadCap, newWriteCap)
 			if err != nil {
 				return fmt.Errorf("failed to scale table: %w", err)

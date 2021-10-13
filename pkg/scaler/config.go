@@ -40,7 +40,7 @@ type TableScalingConfig struct {
 	WriteBufferCapacity float64
 
 	ScaleDownDelay time.Duration
-	lastScaleDown  time.Time
+	lastScaleTime  time.Time
 }
 
 func (tsc *TableScalingConfig) String() string {
